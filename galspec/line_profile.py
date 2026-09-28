@@ -687,7 +687,7 @@ class tie_MultiGauss_dv_w2(object):
         self.ref_name = ref_name
 
     def __call__(self, model):
-        return model[self.ref_name].dv_w1
+        return model[self.ref_name].dv_w2
 
 
 class tie_MultiGauss_dv_w3(object):
@@ -695,7 +695,7 @@ class tie_MultiGauss_dv_w3(object):
         self.ref_name = ref_name
 
     def __call__(self, model):
-        return model[self.ref_name].dv_w1
+        return model[self.ref_name].dv_w3
 
 
 class tie_MultiGauss_dv_w4(object):
@@ -703,7 +703,7 @@ class tie_MultiGauss_dv_w4(object):
         self.ref_name = ref_name
 
     def __call__(self, model):
-        return model[self.ref_name].dv_w1
+        return model[self.ref_name].dv_w4
 
 
 class tie_MultiGauss_amp_w0(object):
@@ -720,6 +720,13 @@ class tie_MultiGauss_amp_w1(object):
 
     def __call__(self, model):
         return model[self.ref_name].amp_w1
+
+class tie_MultiGauss_amp_w2(object):
+    def __init__(self, ref_name):
+        self.ref_name = ref_name
+
+    def __call__(self, model):
+        return model[self.ref_name].amp_w2
 
 
 class tie_MultiGauss_sigma_c(object):
@@ -744,6 +751,13 @@ class tie_MultiGauss_sigma_w1(object):
 
     def __call__(self, model):
         return model[self.ref_name].sigma_w1
+
+class tie_MultiGauss_sigma_w2(object):
+    def __init__(self, ref_name):
+        self.ref_name = ref_name
+
+    def __call__(self, model):
+        return model[self.ref_name].sigma_w2
 
 
 class tie_MultiGauss_doublet_ratio(object):
