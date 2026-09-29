@@ -26,6 +26,13 @@ try:
 except ImportError:  # pragma: no cover
     corner = None
 
+try: 
+    from dynesty import plotting as dyplot
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover
+    dyplot = None
+    plt = None
+
 __all__ = ["Dynesty_Fit"]
 
 _WORKER_FIT = None
@@ -51,6 +58,70 @@ class _LikelihoodPool:
         if getattr(ignored_function, "__name__", None) is not None:
             return self._pool.map(ignored_function, values)
         return self._pool.map(_worker_log_likelihood, values)
+
+
+class _ReloadedResults:
+    """Give a FITS-restored results stub the interface ``dynesty.plotting`` expects.
+
+    ``load_dynesty_fit_from_fits`` stores plain arrays on a bare container, whereas
+    ``dyplot.cornerplot``/``runplot``/``traceplot`` index the results object
+    (``results['logvol']``) and call ``results.importance_weights()``. This adapter
+    supplies exactly those, so the plotting methods also work on a restored fit.
+
+    Note the RAW samples are used rather than ``samples_equal_weight``: ``traceplot``
+    pairs every sample with its own ``logvol``, and ``resample_equal`` deliberately
+    returns its output in random order, which would destroy that pairing.
+    """
+
+    _ARRAYS = ("samples", "logwt", "logvol", "logl", "logz", "logzerr", "information")
+
+    def __init__(self, stub, nlive=None):
+        for key in self._ARRAYS:
+            value = getattr(stub, key, None)
+            if value is not None:
+                setattr(self, key, np.asarray(value))
+        missing = [key for key in ("samples", "logwt", "logz") if not hasattr(self, key)]
+        if missing:
+            raise RuntimeError(
+                "restored results are missing {}; cannot plot".format(", ".join(missing)))
+        self.nlive = int(nlive) if nlive is not None else len(self.samples)
+
+        # `save_dynesty_fit_to_fits` thins the per-iteration arrays (samples, logwt,
+        # logl, logvol) but writes logz/logzerr in full, and `runplot` plots logz
+        # against -logvol. Put them back on the sample grid; both endpoints are
+        # shared, so logz[-1] -- which importance_weights() relies on -- is exact.
+        nsamples = len(self.samples)
+        for key in ("logz", "logzerr"):
+            array = getattr(self, key, None)
+            if array is not None and len(array) != nsamples:
+                grid = np.linspace(0.0, 1.0, nsamples)
+                setattr(self, key, np.interp(grid, np.linspace(0.0, 1.0, len(array)), array))
+
+    @property
+    def niter(self):
+        # `runplot` sizes its live-points panel from niter. After thinning, no array
+        # records the iteration count, and the final live points cannot be identified
+        # inside a thinned array, so report the stored sample count (runplot then
+        # disables `mark_final_live` with a warning, which is the honest outcome).
+        return len(self.samples)
+
+    def keys(self):
+        return [key for key in self._ARRAYS if hasattr(self, key)]
+
+    def __getitem__(self, key):
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key) from None
+
+    def __contains__(self, key):
+        return hasattr(self, key)
+
+    def importance_weights(self):
+        # Normalised: thinning leaves the raw exp(logwt - logz[-1]) summing to ~1/thin,
+        # which is not a probability vector over the stored samples.
+        weights = np.exp(self.logwt - self.logz[-1])
+        return weights / np.sum(weights)
 
 
 class Dynesty_Fit:
@@ -357,3 +428,112 @@ class Dynesty_Fit:
             self.get_best_fit()
         return corner.corner(self.samples_equal_weight, labels=self.param_names,
                              truths=self.theta_best, **kwargs)
+
+    def _results_for_plotting(self):
+        """Return a results object usable by ``dynesty.plotting``.
+
+        A live fit already holds a real :class:`dynesty.results.Results`. A fit
+        restored by :func:`load_dynesty_fit_from_fits` holds only plain arrays, so
+        wrap them in :class:`_ReloadedResults` to expose the interface ``dyplot``
+        needs (item access plus ``importance_weights``).
+        """
+        if self.results is None:
+            raise RuntimeError("fit() must be run first")
+        if hasattr(self.results, "importance_weights"):
+            return self.results
+        return _ReloadedResults(self.results, nlive=self.nlive)
+
+    def plot_corner_dyplot(self, figsize=(11, 11)):
+        """Corner plot drawn by ``dynesty.plotting.cornerplot``.
+
+        Uses the sampler's own results when they are still in memory; on a restored
+        fit it falls back to the arrays stored in the FITS file. For a fallback that
+        needs nothing but the resampled posterior, see :meth:`plot_corner`.
+        """
+        if (dyplot is None) or (plt is None):
+            raise ImportError("dynesty and matplotlib is required for plotting")
+        results = self._results_for_plotting()
+        if self.theta_best is None:
+            self.get_best_fit()
+
+        fig, axes = plt.subplots(self.ndim, self.ndim, figsize=figsize)
+
+        fig_corner, axes_corner = dyplot.cornerplot(
+            results,
+            fig=(fig, axes),
+            labels=self.param_names,
+            truths=self.theta_best,
+            color='blue',
+            truth_color='black',
+            show_titles=True,
+            quantiles=[0.16, 0.5, 0.84],                #±1σ
+            title_quantiles=[0.16, 0.5, 0.84],
+            title_fmt='.3g',
+            max_n_ticks=3,
+            title_kwargs={'y': 1.05, 'fontsize': 6},
+            label_kwargs={'fontsize': 7},
+            )
+        return fig_corner, axes_corner
+
+    def plot_summary(self, figsize=(16, 16)):
+        """Run diagnostics drawn by ``dynesty.plotting.runplot``."""
+        if (dyplot is None) or (plt is None):
+            raise ImportError("dynesty and matplotlib is required for plotting")
+        results = self._results_for_plotting()
+
+        fig, axes = plt.subplots(4, 1, figsize=figsize)
+
+        fig_summary, axes_summary = dyplot.runplot(
+            results,
+            fig=(fig, axes),   # default would be a 16x16 in figure
+            color='C3',
+            lnz_error=True,
+            mark_final_live=True,
+        )
+        return fig_summary, axes_summary
+
+    def plot_trace(self, figsize=None):
+        """Trace plot drawn by ``dynesty.plotting.traceplot``.
+
+        ``figsize=None`` sizes the figure from the number of parameters at ~2.4 in
+        per row, the minimum height that keeps each row's title and labels clear of
+        the row above.
+        """
+        if (dyplot is None) or (plt is None):
+            raise ImportError("dynesty and matplotlib is required for plotting")
+        results = self._results_for_plotting()
+        if figsize is None:
+            figsize = (10, 2.4 * self.ndim)
+        elif figsize[1] / self.ndim < 1.1:
+            # The figure always gets one row per parameter, so a height sized for fewer
+            # rows squeezes them until the labels collide.
+            warnings.warn(
+                "figsize gives {:.2f} in per parameter row, but this model has {} "
+                "parameters; below ~1.1 in per row the labels collide. Pass "
+                "figsize=None to size the figure automatically.".format(
+                    figsize[1] / self.ndim, self.ndim))
+
+        fig_trace, axes_trace = plt.subplots(self.ndim, 2, figsize=figsize,
+                                     gridspec_kw={'hspace': 0.45})
+        # `bottom` is a fraction of the figure height, so a fixed 0.05 starves short
+        # figures of the absolute margin the bottom row's x-label needs.
+        bottom = max(0.05, 0.55 / figsize[1])
+        fig_trace.subplots_adjust(top=0.985, bottom=bottom, left=0.07, right=0.985)
+
+        fig_trace, axes_trace = dyplot.traceplot(
+            results,
+            # `dims` omitted on purpose: None means every parameter, and it keeps
+            # `labels` in sync with `self.param_names` without index bookkeeping.
+            fig=(fig_trace, axes_trace),          # must hold exactly len(labels) x 2 panels
+            labels=list(self.param_names),
+            quantiles=[0.16, 0.5, 0.84],
+            # show_titles=True would print median_{-a}^{+b} above each right panel, but it needs
+            # ~3 in of row height to clear the row above. The quantile table has the numbers.
+            show_titles=False,
+            thin=5,
+            max_n_ticks=3,
+            label_kwargs={'fontsize': 8},
+        )
+        return fig_trace, axes_trace
+
+    
