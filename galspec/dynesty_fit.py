@@ -73,9 +73,10 @@ class _ReloadedResults:
     returns its output in random order, which would destroy that pairing.
     """
 
-    _ARRAYS = ("samples", "logwt", "logvol", "logl", "logz", "logzerr", "information")
+    _ARRAYS = ("samples", "samples_id", "logwt", "logvol", "logl", "logz", "logzerr",
+               "information")
 
-    def __init__(self, stub, nlive=None):
+    def __init__(self, stub, nlive=None, logz_final=None, niter=None):
         for key in self._ARRAYS:
             value = getattr(stub, key, None)
             if value is not None:
@@ -85,11 +86,20 @@ class _ReloadedResults:
             raise RuntimeError(
                 "restored results are missing {}; cannot plot".format(", ".join(missing)))
         self.nlive = int(nlive) if nlive is not None else len(self.samples)
+        self._niter = int(niter) if niter is not None else None
 
-        # `save_dynesty_fit_to_fits` thins the per-iteration arrays (samples, logwt,
-        # logl, logvol) but writes logz/logzerr in full, and `runplot` plots logz
-        # against -logvol. Put them back on the sample grid; both endpoints are
-        # shared, so logz[-1] -- which importance_weights() relies on -- is exact.
+        # The weights need the *final* evidence as the normalisation. With thinning
+        # the last stored logz is an earlier iteration, so prefer the exact value
+        # from the file's LOG_EVIDENCE keyword.
+        if logz_final is not None and np.isfinite(logz_final):
+            self._logz_final = float(logz_final)
+        else:
+            self._logz_final = float(self.logz[-1])
+
+        # Files written before the per-iteration arrays were thinned together store
+        # logz/logzerr at full length; put them back on the sample grid so runplot
+        # can pair them with -logvol. Both endpoints are shared by the interpolation,
+        # so logz[-1] survives it.
         nsamples = len(self.samples)
         for key in ("logz", "logzerr"):
             array = getattr(self, key, None)
@@ -99,11 +109,17 @@ class _ReloadedResults:
 
     @property
     def niter(self):
-        # `runplot` sizes its live-points panel from niter. After thinning, no array
-        # records the iteration count, and the final live points cannot be identified
-        # inside a thinned array, so report the stored sample count (runplot then
-        # disables `mark_final_live` with a warning, which is the honest outcome).
-        return len(self.samples)
+        # `runplot` builds its live-points panel as `ones(niter) * nlive` and plots it
+        # against -logvol, which is `len(samples)` long. So it only accepts a niter
+        # satisfying `niter == nsamps` (flat panel) or `nsamps - niter == nlive`
+        # (flat panel plus the descending final-live-points tail); any other value
+        # raises a shape error. A full-resolution file meets the second identity
+        # exactly, so its stored count is used as-is. A thinned file meets neither,
+        # and the count the stored subsample represents is reported instead -- which
+        # keeps the panel level right and lets `mark_final_live` still mark the tail.
+        if self._niter is not None and self._niter + self.nlive == len(self.samples):
+            return self._niter
+        return max(1, len(self.samples) - self.nlive)
 
     def keys(self):
         return [key for key in self._ARRAYS if hasattr(self, key)]
@@ -120,8 +136,38 @@ class _ReloadedResults:
     def importance_weights(self):
         # Normalised: thinning leaves the raw exp(logwt - logz[-1]) summing to ~1/thin,
         # which is not a probability vector over the stored samples.
-        weights = np.exp(self.logwt - self.logz[-1])
+        weights = np.exp(self.logwt - self._logz_final)
         return weights / np.sum(weights)
+
+
+class _EqualWeightResults:
+    """Present ``samples_equal_weight`` in the shape ``dynesty.plotting`` expects.
+
+    ``resample_equal`` draws every row of ``samples_equal_weight`` with the same
+    weight, so those samples *are* the posterior and a plot that needs nothing but
+    the posterior can read them directly instead of going through ``self.results``
+    and its importance weights. Only ``samples``/``importance_weights()`` are
+    supplied: the run history (``logvol``, ``logz``, ``niter``, ...) is deliberately
+    absent, because resampling shuffles the samples and so no longer pairs a sample
+    with its own point along the chain.
+    """
+
+    def __init__(self, samples):
+        self.samples = np.asarray(samples)
+
+    def importance_weights(self):
+        return np.full(len(self.samples), 1.0 / len(self.samples))
+
+    def keys(self):
+        return ["samples"]
+
+    def __getitem__(self, key):
+        if key == "samples":
+            return self.samples
+        raise KeyError(key)
+
+    def __contains__(self, key):
+        return key == "samples"
 
 
 class Dynesty_Fit:
@@ -151,6 +197,14 @@ class Dynesty_Fit:
         "redshift": (-0.1, 0.1),
         "velscale": (10.0, 1000.0),
     }
+
+    # Plot geometry in inches, shared by the plotting methods.
+    # A corner plot grows as n^2 panels and a trace plot as n rows, so a fixed
+    # figure squeezes them until the ticks and titles collide.
+    #: Panel edge that keeps ticks and labels legible.
+    _MIN_PANEL_SIZE = 1.1
+    #: Panel edge used when the corner figure size is derived automatically.
+    _CORNER_PANEL_SIZE = 2.2
 
     def __init__(self, model, wave_use, flux_use, ferr, bounds_dict=None,
                  default_bounds=None, sample_method="rwalk", nlive=500,
@@ -419,15 +473,163 @@ class Dynesty_Fit:
             raise RuntimeError("fit() must be run first")
         return self.log_evidence, self.log_evidence_err
 
-    def plot_corner(self, **kwargs):
-        if corner is None:
-            raise ImportError("corner is required for plotting")
+    def _resolve_params(self, params):
+        """Turn a ``params`` selection into indices into :attr:`param_names`.
+
+        ``None`` selects every parameter, in the fitted order. Otherwise ``params``
+        is a sequence naming the parameters to keep, in the order they are to be
+        plotted; each entry is either an index or a parameter name, and the two
+        styles can be mixed -- ``params=[0, 1, 'sigma_c_7']``. Names are matched
+        against :attr:`param_names`, then against :attr:`full_param_names`, then
+        against the readable labels from :meth:`parameter_labels`, so
+        ``'sigma_c_7'``, ``'broad Halpha.sigma_c'`` and
+        ``'broad Halpha sigma_c'`` all work.
+        """
+        if params is None:
+            return list(range(self.ndim))
+
+        indices = []
+        for entry in params:
+            if isinstance(entry, str):
+                candidates = (self.param_names, self.full_param_names,
+                              self.parameter_labels(style='compound'))
+                for names in candidates:
+                    if entry in names:
+                        indices.append(names.index(entry))
+                        break
+                else:
+                    raise ValueError(
+                        "unknown parameter {!r}; the model has {}".format(
+                            entry, ", ".join(self.full_param_names)))
+                continue
+            index = int(entry)
+            if index < 0:                      # allow the usual negative indexing
+                index += self.ndim
+            if not 0 <= index < self.ndim:
+                raise IndexError(
+                    "parameter index {} is out of range for {} parameters".format(
+                        entry, self.ndim))
+            indices.append(index)
+        return indices
+
+    #: How the plotting methods label parameters.
+    #:   ``'compound'`` -> ``'narrow Halpha amplitude'``
+    #:   ``'dot'``      -> ``'narrow Halpha.amplitude'``  (as in full_param_names)
+    #:   ``'index'``    -> ``'amplitude_1'``             (the raw sampler name)
+    _LABEL_STYLES = ('compound', 'dot', 'index')
+
+    def _compound_name(self, param_name):
+        """Split a compound parameter name into ``(component, parameter)``.
+
+        ``'amp_c_2'`` -> ``('broad Halpha', 'amp_c')``. The trailing index selects
+        the submodel directly, so this keeps working even when two components share
+        a name or the names were auto-generated.
+        """
+        base = self._base_name(param_name)
+        suffix = param_name[len(base) + 1:] if param_name.startswith(base + '_') else ''
+        if suffix.isdigit():
+            submodel_names = list(getattr(self.model, 'submodel_names', ()) or ())
+            index = int(suffix)
+            if 0 <= index < len(submodel_names):
+                return submodel_names[index], base
+        return None, base
+
+    def parameter_labels(self, index=None, style='compound'):
+        """Readable labels for the parameters at ``index``.
+
+        The name given to the component when it was built is combined with the
+        parameter's own name, so a parameter the sampler reports as ``amplitude_1``
+        on a component named ``'narrow Halpha'`` is labelled
+        ``'narrow Halpha amplitude'``.
+        """
+        if style not in self._LABEL_STYLES:
+            raise ValueError("label_style must be one of {}; got {!r}".format(
+                ", ".join(self._LABEL_STYLES), style))
+        if index is None:
+            index = range(self.ndim)
+        labels = []
+        for i in index:
+            name = self.param_names[i]
+            if style == 'index':
+                labels.append(name)
+                continue
+            component, base = self._compound_name(name)
+            if component is None:
+                labels.append(name)
+            elif style == 'dot':
+                labels.append("{}.{}".format(component, base))
+            else:
+                labels.append("{} {}".format(component, base))
+        return labels
+
+    def _plot_labels(self, index, labels, label_style):
+        """Resolve the labels for a plot of the parameters at ``index``."""
+        if labels is None:
+            return self.parameter_labels(index, style=label_style)
+        labels = list(labels)
+        if len(labels) != len(index):
+            raise ValueError("got {} labels for {} parameters".format(
+                len(labels), len(index)))
+        return labels
+
+    def _corner_figsize(self, nplot, figsize=None):
+        """Return the figure size for a corner plot of ``nplot`` parameters.
+
+        With ``figsize=None`` the size is derived from the panel count, so every
+        panel keeps the same room for its ticks and titles however many parameters
+        are selected. An explicit ``figsize`` is passed through, after warning when
+        its panels are too small to stay legible.
+        """
+        if figsize is not None:
+            if figsize[0] / nplot < self._MIN_PANEL_SIZE:
+                warnings.warn(
+                    "figsize gives {:.2f} in per parameter panel, but {} parameters "
+                    "are plotted; below ~{:.1f} in the ticks and titles collide. "
+                    "Pass figsize=None to size the figure automatically.".format(
+                        figsize[0] / nplot, nplot, self._MIN_PANEL_SIZE))
+            return figsize
+
+        side = self._CORNER_PANEL_SIZE * nplot
+        return (side, side)
+
+    def plot_corner(self, params=None, figsize=None, labels=None,
+                    label_style='compound', **kwargs):
+        """Corner plot drawn by the ``corner`` package.
+
+        ``params`` selects which parameters to plot, as in :meth:`_resolve_params`.
+        ``figsize=None`` sizes the figure from the number of plotted parameters, as
+        in :meth:`_corner_figsize`. ``labels`` overrides the axis labels outright;
+        by default they come from :meth:`parameter_labels` and name the component
+        each parameter belongs to, in the style set by ``label_style``.
+        """
+        if (corner is None) or (plt is None):
+            raise ImportError("corner and matplotlib is required for plotting")
         if self.samples_equal_weight is None:
             raise RuntimeError("fit() must be run first")
         if self.theta_best is None:
             self.get_best_fit()
-        return corner.corner(self.samples_equal_weight, labels=self.param_names,
-                             truths=self.theta_best, **kwargs)
+        index = self._resolve_params(params)
+        labels = self._plot_labels(index, labels, label_style)
+        samples = self.samples_equal_weight[:, index]
+        # corner has no `figsize` argument -- it would be swallowed by its **kwargs
+        # and the size ignored -- so the figure is created here and handed to it.
+        fig = plt.figure(figsize=self._corner_figsize(len(index), figsize))
+        if len(index) != 1:
+            return corner.corner(samples, labels=labels, fig=fig,
+                                 truths=self.theta_best[index], **kwargs)
+
+        # A one-parameter corner plot cannot take `truths`: corner 2.2.3's
+        # `_get_fig_axes` returns a bare Axes for a single panel, which
+        # `overplot_lines` then indexes as `axes[k1, k1]` and raises "'Axes' object
+        # is not subscriptable". Suppress it and draw the same line here; the square
+        # marker corner adds along with it is skipped for one parameter anyway.
+        truth = self.theta_best[index][0]
+        truth_color = kwargs.pop('truth_color', '#4682b4')     # corner's own default
+        fig = corner.corner(samples, labels=labels, fig=fig,
+                            truths=None, **kwargs)
+        if truth is not None:
+            fig.axes[0].axvline(truth, color=truth_color)
+        return fig
 
     def _results_for_plotting(self):
         """Return a results object usable by ``dynesty.plotting``.
@@ -436,33 +638,56 @@ class Dynesty_Fit:
         restored by :func:`load_dynesty_fit_from_fits` holds only plain arrays, so
         wrap them in :class:`_ReloadedResults` to expose the interface ``dyplot``
         needs (item access plus ``importance_weights``).
+
+        For the run-history diagnostics (:meth:`plot_summary`, :meth:`plot_trace`),
+        which need ``logvol``/``logz``/``niter`` and not just the posterior. A plot
+        that needs only the posterior should use :class:`_EqualWeightResults`
+        instead, which does not depend on the raw sampler output surviving.
         """
         if self.results is None:
             raise RuntimeError("fit() must be run first")
         if hasattr(self.results, "importance_weights"):
             return self.results
-        return _ReloadedResults(self.results, nlive=self.nlive)
+        return _ReloadedResults(self.results, nlive=self.nlive,
+                                logz_final=self.log_evidence,
+                                niter=getattr(self.results, "niter", None))
 
-    def plot_corner_dyplot(self, figsize=(11, 11)):
+    def plot_corner_dyplot(self, params=None, figsize=None, labels=None,
+                           label_style='compound'):
         """Corner plot drawn by ``dynesty.plotting.cornerplot``.
 
-        Uses the sampler's own results when they are still in memory; on a restored
-        fit it falls back to the arrays stored in the FITS file. For a fallback that
-        needs nothing but the resampled posterior, see :meth:`plot_corner`.
+        Drawn from ``samples_equal_weight``, the same resampled posterior as
+        :meth:`plot_corner`, so both corner plots show one posterior; ``self.results``
+        is not needed and the plot therefore also works on a restored fit.
+
+        ``params`` selects which parameters to plot, as in :meth:`_resolve_params`.
+        ``figsize=None`` sizes the figure from the number of plotted parameters, as
+        in :meth:`_corner_figsize`. ``labels`` overrides the axis labels outright;
+        by default they come from :meth:`parameter_labels` and name the component
+        each parameter belongs to, in the style set by ``label_style``.
         """
         if (dyplot is None) or (plt is None):
             raise ImportError("dynesty and matplotlib is required for plotting")
-        results = self._results_for_plotting()
+        if self.samples_equal_weight is None:
+            raise RuntimeError("fit() must be run first")
+        index = self._resolve_params(params)
+        labels = self._plot_labels(index, labels, label_style)
+        results = _EqualWeightResults(self.samples_equal_weight)
         if self.theta_best is None:
             self.get_best_fit()
 
-        fig, axes = plt.subplots(self.ndim, self.ndim, figsize=figsize)
+        # The panel grid must hold one row and column per plotted parameter, while
+        # `dims` slices the samples inside cornerplot -- so `labels` and `truths`
+        # have to be sliced here to stay aligned with it.
+        figsize = self._corner_figsize(len(index), figsize)
+        fig, axes = plt.subplots(len(index), len(index), figsize=figsize)
 
         fig_corner, axes_corner = dyplot.cornerplot(
             results,
             fig=(fig, axes),
-            labels=self.param_names,
-            truths=self.theta_best,
+            dims=index,
+            labels=labels,
+            truths=self.theta_best[index],
             color='blue',
             truth_color='black',
             show_titles=True,
@@ -475,45 +700,61 @@ class Dynesty_Fit:
             )
         return fig_corner, axes_corner
 
-    def plot_summary(self, figsize=(16, 16)):
-        """Run diagnostics drawn by ``dynesty.plotting.runplot``."""
-        if (dyplot is None) or (plt is None):
-            raise ImportError("dynesty and matplotlib is required for plotting")
-        results = self._results_for_plotting()
+    def plot_summary(self, figsize=(16, 16), logplot=True):
+        """Run diagnostics drawn by ``dynesty.plotting.runplot``.
 
-        fig, axes = plt.subplots(4, 1, figsize=figsize)
-
-        fig_summary, axes_summary = dyplot.runplot(
-            results,
-            fig=(fig, axes),   # default would be a 16x16 in figure
-            color='C3',
-            lnz_error=True,
-            mark_final_live=True,
-        )
-        return fig_summary, axes_summary
-
-    def plot_trace(self, figsize=None):
-        """Trace plot drawn by ``dynesty.plotting.traceplot``.
-
-        ``figsize=None`` sizes the figure from the number of parameters at ~2.4 in
-        per row, the minimum height that keeps each row's title and labels clear of
-        the row above.
+        ``logplot=True`` (the default) plots log Z in the evidence panel. Without it
+        that panel is degenerate for any real fit: the evidence is a few hundred in
+        magnitude, so ``exp(log Z)`` underflows to zero and the panel is a flat line
+        at 0 (which also triggers runplot's "identical ylims" warning).
         """
         if (dyplot is None) or (plt is None):
             raise ImportError("dynesty and matplotlib is required for plotting")
         results = self._results_for_plotting()
-        if figsize is None:
-            figsize = (10, 2.4 * self.ndim)
-        elif figsize[1] / self.ndim < 1.1:
-            # The figure always gets one row per parameter, so a height sized for fewer
-            # rows squeezes them until the labels collide.
-            warnings.warn(
-                "figsize gives {:.2f} in per parameter row, but this model has {} "
-                "parameters; below ~1.1 in per row the labels collide. Pass "
-                "figsize=None to size the figure automatically.".format(
-                    figsize[1] / self.ndim, self.ndim))
 
-        fig_trace, axes_trace = plt.subplots(self.ndim, 2, figsize=figsize,
+        fig_summary, axes_summary = dyplot.runplot(
+            results,
+            color='C3',
+            lnz_error=True,
+            mark_final_live=True,
+            logplot=logplot,
+        )
+        # The figure is resized here rather than passed to runplot as `fig=`. When
+        # given a figure, runplot reads its y-limits off the blank axes it receives
+        # and then only pins the top, which collapses the evidence panel to an
+        # inverted 0..logZ axis and clips the whole log Z curve off the plot.
+        fig_summary.set_size_inches(*figsize)
+        return fig_summary, axes_summary
+
+    def plot_trace(self, params=None, figsize=None, labels=None,
+                   label_style='compound'):
+        """Trace plot drawn by ``dynesty.plotting.traceplot``.
+
+        ``params`` selects which parameters to plot, as in :meth:`_resolve_params`.
+        ``figsize=None`` sizes the figure from the number of plotted parameters at
+        ~2.4 in per row, the minimum height that keeps each row's title and labels
+        clear of the row above. ``labels`` overrides the axis labels outright; by
+        default they come from :meth:`parameter_labels` and name the component each
+        parameter belongs to, in the style set by ``label_style``.
+        """
+        if (dyplot is None) or (plt is None):
+            raise ImportError("dynesty and matplotlib is required for plotting")
+        index = self._resolve_params(params)
+        labels = self._plot_labels(index, labels, label_style)
+        results = self._results_for_plotting()
+        nrows = len(index)
+        if figsize is None:
+            figsize = (10, 2.4 * nrows)
+        elif figsize[1] / nrows < self._MIN_PANEL_SIZE:
+            # The figure always gets one row per plotted parameter, so a height sized
+            # for fewer rows squeezes them until the labels collide.
+            warnings.warn(
+                "figsize gives {:.2f} in per parameter row, but {} parameters are "
+                "plotted; below ~{:.1f} in per row the labels collide. Pass "
+                "figsize=None to size the figure automatically.".format(
+                    figsize[1] / nrows, nrows, self._MIN_PANEL_SIZE))
+
+        fig_trace, axes_trace = plt.subplots(nrows, 2, figsize=figsize,
                                      gridspec_kw={'hspace': 0.45})
         # `bottom` is a fraction of the figure height, so a fixed 0.05 starves short
         # figures of the absolute margin the bottom row's x-label needs.
@@ -522,10 +763,11 @@ class Dynesty_Fit:
 
         fig_trace, axes_trace = dyplot.traceplot(
             results,
-            # `dims` omitted on purpose: None means every parameter, and it keeps
-            # `labels` in sync with `self.param_names` without index bookkeeping.
+            # `labels` must list the plotted parameters only, in the order given by
+            # `dims`, since traceplot slices the samples but not the labels.
             fig=(fig_trace, axes_trace),          # must hold exactly len(labels) x 2 panels
-            labels=list(self.param_names),
+            dims=index,
+            labels=labels,
             quantiles=[0.16, 0.5, 0.84],
             # show_titles=True would print median_{-a}^{+b} above each right panel, but it needs
             # ~3 in of row height to clear the row above. The quantile table has the numbers.

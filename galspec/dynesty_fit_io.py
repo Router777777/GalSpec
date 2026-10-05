@@ -26,6 +26,20 @@ from .mcmc_fit_io import (
 )
 
 
+def _niter_of(dynesty_fit):
+    """Number of sampling iterations recorded in ``dynesty_fit``, if it has been run."""
+    results = getattr(dynesty_fit, 'results', None)
+    if results is None:
+        return None
+    niter = getattr(results, 'niter', None)
+    if niter is not None:
+        return int(niter)
+    # Results restored from a file written before NITER existed: fall back to the
+    # stored array length, which for a thinned file is the sample count, not niter.
+    logl = getattr(results, 'logl', None)
+    return int(len(logl)) if logl is not None else None
+
+
 def save_dynesty_fit_to_fits(dynesty_fit, filename, thin=1):
     """
     Save a Dynesty_Fit object entirely into a FITS file.
@@ -37,8 +51,17 @@ def save_dynesty_fit_to_fits(dynesty_fit, filename, thin=1):
     filename : str
         The output FITS filename.
     thin : int, optional
-        Thinning factor for samples arrays.
-        If thin > 1, only every Nth sample will be saved.
+        Thinning factor for the per-iteration arrays -- ``samples``, ``logwt``,
+        ``logl``, ``logvol``, ``logz``, ``logzerr``, ``information`` and
+        ``samples_id``. If thin > 1, only every Nth entry is saved. All of them are
+        thinned together so the saved arrays keep matching lengths, which is what
+        lets ``dynesty.plotting`` work on a restored fit. The exact final evidence
+        is written to the LOG_EVIDENCE header regardless of thinning, and is what
+        the importance weights normalise against.
+
+        Note that thinning discards real information: the posterior is carried by
+        the importance weights, whose effective sample size can be far smaller than
+        the sample count. Check the ESS before choosing thin > 1.
         Default is 1 (no thinning).
     """
     if thin < 1:
@@ -54,8 +77,20 @@ def save_dynesty_fit_to_fits(dynesty_fit, filename, thin=1):
     primary_hdr['SAMPLE_METHOD'] = getattr(dynesty_fit, 'sample_method', 'rwalk')
     primary_hdr['BOUND'] = getattr(dynesty_fit, 'bound', 'multi')
     primary_hdr['THIN'] = thin  # Record the thinning factor
-    primary_hdr['LOG_EVIDENCE'] = getattr(dynesty_fit, 'log_evidence', np.nan)
-    primary_hdr['LOG_EVIDENCE_ERR'] = getattr(dynesty_fit, 'log_evidence_err', np.nan)
+
+    # FITS headers reject NaN, so a fit that has not been run omits these keywords
+    # rather than failing to save; the loader defaults them back to NaN.
+    for key, value in (('LOG_EVIDENCE', getattr(dynesty_fit, 'log_evidence', None)),
+                       ('LOG_EVIDENCE_ERR', getattr(dynesty_fit, 'log_evidence_err', None))):
+        if value is not None and np.isfinite(value):
+            primary_hdr[key] = float(value)
+
+    # Number of sampling iterations, so a reloaded fit reports the real count instead
+    # of inferring one from the stored array length.
+    niter = _niter_of(dynesty_fit)
+    if niter is not None:
+        primary_hdr['NITER'] = int(niter)
+
     primary_hdu = fits.PrimaryHDU(header=primary_hdr)
     hdul.append(primary_hdu)
 
@@ -96,17 +131,27 @@ def save_dynesty_fit_to_fits(dynesty_fit, filename, thin=1):
             logvol_thinned = results.logvol[::thin]
             hdul.append(fits.ImageHDU(logvol_thinned, name='LOGVOL'))
 
-        # Save log evidence evolution
+        # Save log evidence evolution. Thinned with the arrays above on purpose: the
+        # quantities that describe one iteration have to keep matching lengths, or
+        # `runplot` cannot plot logz against -logvol. The exact final evidence lives
+        # in the LOG_EVIDENCE header, which is what the importance weights normalise
+        # against, so thinning costs no accuracy.
         if hasattr(results, 'logz'):
-            hdul.append(fits.ImageHDU(results.logz, name='LOGZ'))
+            hdul.append(fits.ImageHDU(np.asarray(results.logz)[::thin], name='LOGZ'))
 
         # Save log evidence errors
         if hasattr(results, 'logzerr'):
-            hdul.append(fits.ImageHDU(results.logzerr, name='LOGZERR'))
+            hdul.append(fits.ImageHDU(np.asarray(results.logzerr)[::thin], name='LOGZERR'))
 
         # Save information matrix
         if hasattr(results, 'information'):
-            hdul.append(fits.ImageHDU(results.information, name='INFORMATION'))
+            hdul.append(fits.ImageHDU(np.asarray(results.information)[::thin], name='INFORMATION'))
+
+        # Sample IDs. Only traceplot(connect=True) reads them, and they are small, so
+        # save them thinned alongside the samples they label.
+        if hasattr(results, 'samples_id'):
+            hdul.append(fits.ImageHDU(
+                np.asarray(results.samples_id, dtype=np.int32)[::thin], name='SAMPLES_ID'))
 
     # Save equal-weighted samples (for corner plots, etc.)
     if hasattr(dynesty_fit, 'samples_equal_weight') and dynesty_fit.samples_equal_weight is not None:
@@ -311,6 +356,10 @@ def load_dynesty_fit_from_fits(filename):
                 results.logzerr = hdul['LOGZERR'].data
             if 'INFORMATION' in hdul:
                 results.information = hdul['INFORMATION'].data
+            if 'SAMPLES_ID' in hdul:
+                results.samples_id = hdul['SAMPLES_ID'].data
+            if 'NITER' in primary_hdr:
+                results.niter = int(primary_hdr['NITER'])
 
         # Read equal-weighted samples
         samples_equal_weight = None
